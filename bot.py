@@ -19,34 +19,41 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
 UNSPLASH_KEY = os.environ.get("UNSPLASH_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Налаштування AI (Gemini)
+# Налаштування AI
 genai.configure(api_key=GEMINI_API_KEY)
+# Використовуємо модель, яка точно працює у тебе
 model = genai.GenerativeModel('gemini-flash-latest')
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# --- Допоміжна функція очистки тексту ---
+def clean_text(text):
+    """Прибирає зайві символи Markdown"""
+    text = text.replace("**", "")  # Прибираємо жирні зірочки
+    text = text.replace("### ", "") # Прибираємо заголовки
+    text = text.replace("## ", "")
+    return text
+
 # --- 1. Функція генерації тексту (AI) ---
 async def generate_ai_post(topic, context):
-    """Просить AI написати повноцінний пост на основі теми."""
+    """Просить AI написати пост."""
     prompt = (
-        f"Ти професійний SMM-менеджер для дитячого центру розвитку. "
-        f"Напиши цікавий, корисний та емоційний пост для Instagram та Telegram українською мовою. "
-        f"Тема посту: {topic}. "
-        f"Ключова думка (контекст): {context}. "
-        f"Вимоги: "
-        f"1. Використовуй смайлики. "
-        f"2. Структуруй текст (заголовок, основна частина, висновок). "
-        f"3. Додай заклик до дії в кінці. "
-        f"4. Додай 5-7 тематичних хештегів. "
-        f"Текст має бути готовим до публікації, без зайвих слів на кшталт 'Ось ваш пост'."
+        f"Ти SMM-менеджер. Напиши пост для Telegram українською мовою."
+        f"\nТема: {topic}."
+        f"\nКонтекст: {context}."
+        f"\nВимоги:"
+        f"\n1. ОБОВ'ЯЗКОВО: Довжина тексту ДО 950 символів (щоб вмістився в підпис фото)."
+        f"\n2. Не використовуй символи ** або ##. Для жирного шрифту використовуй тільки тег <b>Текст</b>."
+        f"\n3. Додай емодзі."
+        f"\n4. Без вступу 'Ось пост', одразу текст."
     )
     try:
         response = model.generate_content(prompt)
-        return response.text
+        return clean_text(response.text)
     except Exception as e:
         logging.error(f"Помилка AI: {e}")
-        return f"<b>{topic}</b>\n\n{context}\n\n(AI не зміг розширити текст, це базова версія)"
+        return f"<b>{topic}</b>\n\n{context}"
 
 # --- 2. Функція пошуку фото ---
 async def get_random_photo(keywords):
@@ -59,7 +66,7 @@ async def get_random_photo(keywords):
         logging.error(f"Помилка Unsplash: {e}")
     return "https://via.placeholder.com/800x600?text=No+Photo"
 
-# --- 3. Основна логіка підготовки чернетки ---
+# --- 3. Основна логіка ---
 async def prepare_draft(manual_day=None):
     day_now = manual_day if manual_day else datetime.datetime.now().day
     
@@ -67,7 +74,6 @@ async def prepare_draft(manual_day=None):
         conn = psycopg2.connect(DATABASE_URL)
         cursor = conn.cursor()
         
-        # Беремо "зерно" (тему) з бази
         cursor.execute(
             "SELECT topic, content, photo_keywords FROM monthly_plan WHERE day_number = %s", 
             (day_now,)
@@ -77,21 +83,20 @@ async def prepare_draft(manual_day=None):
         if result:
             topic, short_context, keywords = result
             
-            # 1. Шукаємо фото
+            # Генеруємо контент
             photo_url = await get_random_photo(keywords)
-            
-            # 2. Генеруємо довгий текст через AI
             full_post_text = await generate_ai_post(topic, short_context)
             
-            # Формуємо повідомлення
+            # Формуємо заголовок чернетки
             caption = f"<b>📅 ЧЕРНЕТКА (День {day_now})</b>\n\n{full_post_text}"
             
-            # Якщо текст задовгий для підпису фото (ліміт Телеграм 1024), обрізаємо
-            if len(caption) > 1000:
-                caption = caption[:950] + "... (текст скорочено для прев'ю)"
+            # Жорстка обрізка без зайвих слів, тільки якщо AI не послухався і написав дуже багато
+            if len(caption) > 1020:
+                caption = caption[:1015] + "..."
             
             builder = InlineKeyboardBuilder()
             builder.row(types.InlineKeyboardButton(text="✅ Опублікувати", callback_data="confirm_publish"))
+            builder.row(types.InlineKeyboardButton(text="🔄 Інше фото", callback_data=f"regen_photo_{day_now}"))
             
             await bot.send_photo(
                 chat_id=ADMIN_ID,
@@ -112,12 +117,14 @@ async def prepare_draft(manual_day=None):
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     if message.from_user.id == ADMIN_ID:
-        await message.answer("🤖 Вмикаю режим копірайтера... Генерую пост...")
+        await message.answer("🤖 Генерую новий варіант...")
         await prepare_draft()
 
+# Кнопка публікації
 @dp.callback_query(F.data == "confirm_publish")
 async def publish_to_channel(callback: types.CallbackQuery):
     caption = callback.message.html_text
+    # Прибираємо слово "ЧЕРНЕТКА"
     clean_caption = caption.split("\n\n", 1)[1] if "ЧЕРНЕТКА" in caption else caption
     
     await bot.send_photo(
@@ -128,8 +135,15 @@ async def publish_to_channel(callback: types.CallbackQuery):
     )
     await callback.message.edit_caption(caption=f"✅ <b>ОПУБЛІКОВАНО</b>\n\n{clean_caption}", parse_mode="HTML")
 
+# Кнопка "Інше фото" (Нова фішка, щоб ти могла поміняти картинку, якщо не сподобалась)
+@dp.callback_query(F.data.startswith("regen_photo_"))
+async def regen_photo(callback: types.CallbackQuery):
+    day = int(callback.data.split("_")[2])
+    await callback.message.answer("🔄 Шукаю інше фото...")
+    await prepare_draft(manual_day=day)
+
 # --- Сервер ---
-async def handle(request): return web.Response(text="AI Bot Running")
+async def handle(request): return web.Response(text="Bot Running")
 
 async def main():
     logging.basicConfig(level=logging.INFO)
