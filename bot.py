@@ -31,9 +31,7 @@ dp = Dispatcher()
 # --- Допоміжні функції ---
 def clean_text(text):
     """Видаляє будь-які спроби форматування"""
-    # Видаляємо Markdown
     text = text.replace("**", "").replace("### ", "").replace("## ", "")
-    # Видаляємо HTML теги (на всяк випадок)
     clean = re.compile('<.*?>')
     text = re.sub(clean, '', text)
     return text.strip()
@@ -46,27 +44,43 @@ def connect_to_db_with_retry():
             time.sleep(5)
             if i == 2: raise e
 
-# --- 1. Логіка AI (ПРОСТИЙ ТЕКСТ) ---
-async def generate_ai_post(topic, context, platform):
+# --- 1. Логіка AI (З ПЕРЕПИСУВАННЯМ) ---
+async def generate_ai_post(topic, context, platform, date_str):
     if platform == "tg":
-        role_desc = "Ти автор блогу в Telegram."
-        # Прибрали вимогу про жирний шрифт
-        requirements = "Стиль корисний, спокійний, експертний. Пиши звичайним текстом без виділень."
-    else: # inst
-        role_desc = "Ти Instagram-блогера."
-        requirements = "Стиль емоційний. Структура: Хук -> Історія -> Користь -> Питання. Додай хештеги."
+        role_desc = "Ти автор блогу дитячого садка в Telegram."
+        requirements = "Стиль корисний, спокійний. Пиши звичайним текстом без виділень."
+    else: 
+        role_desc = "Ти Instagram-блогер дитячого садка."
+        requirements = "Стиль емоційний. Структура: Хук -> Історія -> Користь. Додай хештеги."
 
+    # Перший запит
     prompt = (
-        f"{role_desc} Напиши пост українською мовою.\n"
+        f"{role_desc} Напиши пост українською мовою на дату {date_str}.\n"
         f"Тема: {topic}.\nКонтекст: {context}.\n"
         f"Вимоги: {requirements}\n"
-        f"ВАЖЛИВО: Не використовуй жодного форматування (ніяких ** або <b>). Просто чистий текст."
-        f"Довжина тексту ДО 900 символів."
+        f"ВАЖЛИВО: Не використовуй жодного форматування (ніяких ** або <b>). Просто чистий текст.\n"
+        f"Орієнтуйся на обсяг до 850 символів."
     )
     
     try:
         response = model.generate_content(prompt)
-        return clean_text(response.text)
+        text = clean_text(response.text)
+        
+        # --- ЕТАП ПЕРЕВІРКИ ДОВЖИНИ ---
+        # Якщо текст вийшов довшим за 950 символів (з запасом), просимо переписати
+        if len(text) > 950:
+            logging.info(f"Текст задовгий ({len(text)}), прошу скоротити...")
+            shorten_prompt = (
+                f"Твій попередній текст вийшов занадто довгим ({len(text)} символів).\n"
+                f"Будь ласка, перепиши його коротше, щоб він був СУВОРО до 850 символів.\n"
+                f"Збережи основну думку та стиль.\n"
+                f"Ось текст: {text}"
+            )
+            response_short = model.generate_content(shorten_prompt)
+            text = clean_text(response_short.text)
+            
+        return text
+
     except Exception as e:
         return f"ERROR_AI: {str(e)}"
 
@@ -77,53 +91,58 @@ async def get_random_photo(keywords):
         response = requests.get(url, timeout=10)
         if response.status_code == 200:
             data = response.json()
-            return data[0]['urls']['regular'] if isinstance(data, list) else data['urls']['regular']
+            if isinstance(data, list) and len(data) > 0:
+                return data[0]['urls']['regular']
+            elif isinstance(data, dict) and 'urls' in data:
+                return data['urls']['regular']
     except Exception as e:
         logging.error(f"Unsplash Error: {e}")
     return "https://via.placeholder.com/800x600?text=No+Photo"
 
 # --- 3. Основна функція ---
-async def prepare_draft(platform, manual_day=None, from_command=False):
-    day_now = manual_day if manual_day else datetime.datetime.now().day
+async def prepare_draft(platform, manual_date=None, from_command=False):
+    # Визначаємо дату: або передана вручну, або сьогоднішня
+    today_date = manual_date if manual_date else datetime.datetime.now().date()
+    
     table_name = "telegram_posts" if platform == "tg" else "instagram_posts"
     platform_name = "Telegram" if platform == "tg" else "Instagram"
     
     try:
         conn = connect_to_db_with_retry()
         cursor = conn.cursor()
-        cursor.execute(f"SELECT topic, content, photo_keywords FROM {table_name} WHERE day_number = %s", (day_now,))
+        cursor.execute(f"SELECT topic, content, photo_keywords FROM {table_name} WHERE publish_date = %s", (today_date,))
         result = cursor.fetchone()
         
         if result:
             topic, short_context, keywords = result
             
             if from_command:
-                await bot.send_message(ADMIN_ID, f"🎨 Генерую для {platform_name} (День {day_now})...")
-            elif not manual_day:
-                await bot.send_message(ADMIN_ID, f"⏰ Час посту для {platform_name}!")
+                await bot.send_message(ADMIN_ID, f"🎨 Генерую для {platform_name} (Дата {today_date})...")
+            elif not manual_date:
+                await bot.send_message(ADMIN_ID, f"⏰ Час посту для {platform_name} ({today_date})!")
 
             photo_url = await get_random_photo(keywords)
-            full_post_text = await generate_ai_post(topic, short_context, platform)
+            full_post_text = await generate_ai_post(topic, short_context, platform, str(today_date))
             
-            # Прибрали теги <b> з заголовка
-            caption = f"📸 {platform_name.upper()} (День {day_now})\n\n{full_post_text}"
+            caption = f"📸 {platform_name.upper()} ({today_date})\n\n{full_post_text}"
             
-            if len(caption) > 1020: caption = caption[:1015] + "..."
+            # Якщо навіть після скорочення він довгий (малоймовірно), ставимо крапки
+            if len(caption) > 1020: 
+                caption = caption[:1015] + "..."
             
             builder = InlineKeyboardBuilder()
             if platform == "tg":
-                builder.row(types.InlineKeyboardButton(text="✅ Опублікувати в канал", callback_data="confirm_publish"))
+                builder.row(types.InlineKeyboardButton(text="✅ Опублікувати", callback_data="confirm_publish"))
             
             builder.row(
-                types.InlineKeyboardButton(text="🖼 Інше фото", callback_data=f"photo_{platform}_{day_now}"),
-                types.InlineKeyboardButton(text="📝 Інший текст", callback_data=f"text_{platform}_{day_now}")
+                types.InlineKeyboardButton(text="🖼 Інше фото", callback_data=f"photo_{platform}_{today_date}"),
+                types.InlineKeyboardButton(text="📝 Інший текст", callback_data=f"text_{platform}_{today_date}")
             )
             
-            # ВІДПРАВЛЯЄМО БЕЗ parse_mode (Це гарантує відсутність помилок тегів)
             await bot.send_photo(chat_id=ADMIN_ID, photo=photo_url, caption=caption, reply_markup=builder.as_markup())
             
         else:
-            await bot.send_message(ADMIN_ID, f"⚠️ У таблиці {table_name} немає теми на день {day_now}!")
+            await bot.send_message(ADMIN_ID, f"⚠️ У таблиці {table_name} немає плану на дату {today_date}!")
             
         cursor.close()
         conn.close()
@@ -134,7 +153,7 @@ async def prepare_draft(platform, manual_day=None, from_command=False):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     if message.from_user.id == ADMIN_ID:
-        await message.answer("👋 KidsLand Bot (Текст без форматування)")
+        await message.answer("👋 KidsLand Bot (Smart Shortening + Dates)")
 
 @dp.message(Command("generate_tg"))
 async def cmd_gen_tg(message: types.Message):
@@ -149,22 +168,23 @@ async def cmd_gen_inst(message: types.Message):
 # --- Callbacks ---
 @dp.callback_query(F.data.startswith("photo_"))
 async def regen_photo(callback: types.CallbackQuery):
-    _, platform, day = callback.data.split("_")
-    day = int(day)
+    parts = callback.data.split("_")
+    platform = parts[1]
+    date_str = parts[2]
+    
     table_name = "telegram_posts" if platform == "tg" else "instagram_posts"
 
     await callback.answer("🔄 Шукаю нове фото...")
     try:
         conn = connect_to_db_with_retry()
         cursor = conn.cursor()
-        cursor.execute(f"SELECT photo_keywords FROM {table_name} WHERE day_number = %s", (day,))
+        cursor.execute(f"SELECT photo_keywords FROM {table_name} WHERE publish_date = %s", (date_str,))
         result = cursor.fetchone()
         cursor.close()
         conn.close()
 
         if result:
             new_photo_url = await get_random_photo(result[0])
-            # Зберігаємо підпис
             media = InputMediaPhoto(media=new_photo_url, caption=callback.message.caption)
             await callback.message.edit_media(media=media, reply_markup=callback.message.reply_markup)
     except Exception as e:
@@ -172,8 +192,10 @@ async def regen_photo(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("text_"))
 async def regen_text(callback: types.CallbackQuery):
-    _, platform, day = callback.data.split("_")
-    day = int(day)
+    parts = callback.data.split("_")
+    platform = parts[1]
+    date_str = parts[2]
+    
     table_name = "telegram_posts" if platform == "tg" else "instagram_posts"
     platform_name = "TELEGRAM" if platform == "tg" else "INSTAGRAM"
 
@@ -181,18 +203,16 @@ async def regen_text(callback: types.CallbackQuery):
     try:
         conn = connect_to_db_with_retry()
         cursor = conn.cursor()
-        cursor.execute(f"SELECT topic, content FROM {table_name} WHERE day_number = %s", (day,))
+        cursor.execute(f"SELECT topic, content FROM {table_name} WHERE publish_date = %s", (date_str,))
         result = cursor.fetchone()
         cursor.close()
         conn.close()
 
         if result:
-            new_text = await generate_ai_post(result[0], result[1], platform)
-            new_caption = f"📸 {platform_name} (День {day})\n\n{new_text}"
-            
+            new_text = await generate_ai_post(result[0], result[1], platform, date_str)
+            new_caption = f"📸 {platform_name} ({date_str})\n\n{new_text}"
             if len(new_caption) > 1020: new_caption = new_caption[:1015] + "..."
             
-            # Редагуємо БЕЗ parse_mode
             await callback.message.edit_caption(caption=new_caption, reply_markup=callback.message.reply_markup)
     except Exception as e:
         await callback.message.answer(f"Помилка: {e}")
@@ -205,10 +225,7 @@ async def publish_to_channel(callback: types.CallbackQuery):
          parts = caption.split("\n\n", 1)
          if len(parts) > 1: clean_caption = parts[1]
     
-    # Публікуємо БЕЗ parse_mode
     await bot.send_photo(chat_id=CHANNEL_ID, photo=callback.message.photo[-1].file_id, caption=clean_caption)
-    
-    # Редагуємо повідомлення адміна (тут можна залишити HTML для галочки)
     await callback.message.edit_caption(caption=f"✅ <b>ОПУБЛІКОВАНО</b>\n\n{clean_caption}", parse_mode="HTML")
 
 # --- Сервер ---
@@ -228,7 +245,7 @@ async def main():
     scheduler.start()
     
     try:
-        await bot.send_message(ADMIN_ID, "🟢 KidsLand: Готовий до роботи")
+        await bot.send_message(ADMIN_ID, "🟢 KidsLand: Розумне скорочення активовано! Тепер все працюватиме краще)")
     except:
         pass
 
