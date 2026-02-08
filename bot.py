@@ -241,15 +241,16 @@ async def main():
     
     scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
     scheduler.add_job(prepare_draft, 'cron', hour=9, minute=0, args=['tg'], misfire_grace_time=3600)
-    scheduler.add_job(prepare_draft, 'cron', hour=9, minute=10, args=['inst'], misfire_grace_time=3600)
+    scheduler.add_job(prepare_draft, 'cron', hour=9, minute=5, args=['inst'], misfire_grace_time=3600)
     scheduler.start()
     
     try:
-        await bot.send_message(ADMIN_ID, "🟢 KidsLand: Розумне скорочення активовано! Тепер все працюватиме краще)")
+        await bot.send_message(ADMIN_ID, "🟢 KidsLand: Оновлено. Тепер все працюватиме краще)")
     except:
         pass
 
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
+
     asyncio.run(main())
